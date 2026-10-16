@@ -1,4 +1,4 @@
-4name: Build APK
+name: Build APK
 on:
   push:
     branches: [main]
@@ -49,4 +49,4 @@ jobs:
           fi
           git init -q -b build-logs && git add -A
           git -c user.name=ci -c user.email=ci@users.noreply.github.com commit -qm "report ${{ github.run_number }}"
-          git push -qf "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git" build-logs44
+          git push -qf "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git" build-logs

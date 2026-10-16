@@ -1,0 +1,579 @@
+===== FILE: build.gradle =====
+plugins {
+    id 'com.android.application' version '8.5.2' apply false
+}
+===== FILE: gradle.properties =====
+org.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8
+android.useAndroidX=false
+android.nonTransitiveRClass=true
+===== FILE: settings.gradle =====
+pluginManagement {
+    repositories {
+        google()
+        mavenCentral()
+        gradlePluginPortal()
+    }
+}
+
+dependencyResolutionManagement {
+    repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+    repositories {
+        google()
+        mavenCentral()
+    }
+}
+
+rootProject.name = "BluetoothEarbudsAutoConnect"
+include ':app'
+===== FILE: app/build.gradle =====
+plugins {
+    id 'com.android.application'
+}
+
+android {
+    namespace 'com.btearbuds.autoconnect'
+    compileSdk 34
+
+    defaultConfig {
+        applicationId 'com.btearbuds.autoconnect'
+        minSdk 26
+        // Android 11 (API 30) is the primary target. Behaviour on newer Android is not tested.
+        targetSdk 30
+        versionCode 1
+        versionName '1.0.0'
+    }
+
+    // Personal-use signing key (kept in the repo so every build is signed the same way and
+    // updates install over each other). Do not publish this app to a store with this key.
+    signingConfigs {
+        release {
+            storeFile rootProject.file('signing/btearbuds-release.jks')
+            storeType 'pkcs12'
+            storePassword 'btearbuds'
+            keyAlias 'btearbuds'
+            keyPassword 'btearbuds'
+        }
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+            shrinkResources false
+            signingConfig signingConfigs.release
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_1_8
+        targetCompatibility JavaVersion.VERSION_1_8
+    }
+
+    lint {
+        abortOnError = false
+        checkReleaseBuilds = false
+    }
+}
+
+// No third-party dependencies on purpose: smaller, offline, nothing to track you.
+dependencies {
+}
+===== FILE: app/src/main/AndroidManifest.xml =====
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!-- Needed to see paired devices, read connection state and send connection requests.
+         (On Android 11 this single permission covers it. No location permission is needed
+         because the app never scans for new devices.) -->
+    <uses-permission android:name="android.permission.BLUETOOTH" />
+    <!-- Keeps the optional background monitoring service alive with a visible notification. -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <!-- Restarts monitoring after the phone reboots (only if you turned it on). -->
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+    <!-- Deliberately NOT requested: INTERNET, location, microphone, contacts, storage. -->
+
+    <application
+        android:name=".App"
+        android:allowBackup="false"
+        android:icon="@mipmap/ic_launcher"
+        android:roundIcon="@mipmap/ic_launcher"
+        android:label="Earbuds Auto-Connect"
+        android:supportsRtl="true"
+        android:theme="@style/AppTheme">
+
+        <activity
+            android:name=".ui.MainActivity"
+            android:exported="true"
+            android:launchMode="singleTop">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <activity
+            android:name=".ui.PickDeviceActivity"
+            android:exported="false" />
+        <activity
+            android:name=".ui.HistoryActivity"
+            android:exported="false" />
+        <activity
+            android:name=".ui.DiagnosticsActivity"
+            android:exported="false" />
+        <activity
+            android:name=".ui.SettingsActivity"
+            android:exported="false" />
+
+        <service
+            android:name=".service.MonitorService"
+            android:exported="false"
+            android:foregroundServiceType="connectedDevice" />
+
+        <receiver
+            android:name=".service.BootReceiver"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+                <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
+            </intent-filter>
+        </receiver>
+
+        <service
+            android:name=".service.ConnectTileService"
+            android:exported="true"
+            android:icon="@drawable/ic_stat_bluetooth"
+            android:label="Earbuds"
+            android:permission="android.permission.BIND_QUICK_SETTINGS_TILE">
+            <intent-filter>
+                <action android:name="android.service.quicksettings.action.QS_TILE" />
+            </intent-filter>
+        </service>
+
+    </application>
+</manifest>
+===== FILE: app/src/main/java/com/btearbuds/autoconnect/App.java =====
+package com.btearbuds.autoconnect;
+
+import android.app.Application;
+
+import com.btearbuds.autoconnect.service.Notifs;
+
+public final class App extends Application {
+    @Override
+    public void onCreate() {
+        super.onCreate();
+        Notifs.ensureChannels(this);
+    }
+}
+===== FILE: app/src/main/java/com/btearbuds/autoconnect/bt/AudioRoute.java =====
+package com.btearbuds.autoconnect.bt;
+
+import android.content.Context;
+import android.media.AudioDeviceInfo;
+import android.media.AudioManager;
+import android.os.Build;
+
+/**
+ * Looks at Android's audio output list to tell "Bluetooth says connected" apart from
+ * "audio is actually routed to these earbuds". Uses only public AudioManager APIs.
+ */
+public final class AudioRoute {
+
+    /** An A2DP (music) output exists for this device's address. */
+    public final boolean a2dpRouteForDevice;
+    /** Some Bluetooth A2DP output exists (possibly another device). */
+    public final boolean anyA2dpRoute;
+    /** A Bluetooth call (SCO) output exists. */
+    public final boolean scoRoute;
+    /** Android 9+ reports addresses so routes can be matched to a device. */
+    public final boolean addressComparable;
+    public final int musicVolume;
+    public final int musicVolumeMax;
+    public final boolean musicActive;
+
+    private AudioRoute(boolean a2dpRouteForDevice, boolean anyA2dpRoute, boolean scoRoute,
+                       boolean addressComparable, int musicVolume, int musicVolumeMax,
+                       boolean musicActive) {
+        this.a2dpRouteForDevice = a2dpRouteForDevice;
+        this.anyA2dpRoute = anyA2dpRoute;
+        this.scoRoute = scoRoute;
+        this.addressComparable = addressComparable;
+        this.musicVolume = musicVolume;
+        this.musicVolumeMax = musicVolumeMax;
+        this.musicActive = musicActive;
+    }
+
+    public static AudioRoute check(Context context, String deviceAddress) {
+        AudioManager am = (AudioManager) context.getSystemService(Context.AUDIO_SERVICE);
+        if (am == null) {
+            return new AudioRoute(false, false, false, false, -1, -1, false);
+        }
+        boolean forDevice = false;
+        boolean anyA2dp = false;
+        boolean sco = false;
+        boolean comparable = Build.VERSION.SDK_INT >= 28;
+        try {
+            AudioDeviceInfo[] outs = am.getDevices(AudioManager.GET_DEVICES_OUTPUTS);
+            if (outs != null) {
+                for (int i = 0; i < outs.length; i++) {
+                    AudioDeviceInfo info = outs[i];
+                    int type = info.getType();
+                    boolean addrMatch = false;
+                    if (comparable && deviceAddress != null) {
+                        String a = info.getAddress();
+                        addrMatch = a != null && a.equalsIgnoreCase(deviceAddress);
+                    }
+                    if (type == AudioDeviceInfo.TYPE_BLUETOOTH_A2DP) {
+                        anyA2dp = true;
+                        if (addrMatch) {
+                            forDevice = true;
+                        }
+                    } else if (type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO) {
+                        if (!comparable || addrMatch) {
+                            sco = true;
+                        }
+                    }
+                }
+            }
+        } catch (RuntimeException e) {
+            // leave defaults
+        }
+        int vol = -1;
+        int max = -1;
+        boolean active = false;
+        try {
+            vol = am.getStreamVolume(AudioManager.STREAM_MUSIC);
+            max = am.getStreamMaxVolume(AudioManager.STREAM_MUSIC);
+            active = am.isMusicActive();
+        } catch (RuntimeException e) {
+            // leave defaults
+        }
+        return new AudioRoute(forDevice, anyA2dp, sco, comparable, vol, max, active);
+    }
+}
+===== FILE: app/src/main/java/com/btearbuds/autoconnect/bt/BtController.java =====
+package com.btearbuds.autoconnect.bt;
+
+import android.bluetooth.BluetoothA2dp;
+import android.bluetooth.BluetoothAdapter;
+import android.bluetooth.BluetoothDevice;
+import android.bluetooth.BluetoothHeadset;
+import android.bluetooth.BluetoothProfile;
+import android.content.BroadcastReceiver;
+import android.content.Context;
+import android.content.Intent;
+import android.content.IntentFilter;
+import android.os.Handler;
+import android.os.Looper;
+
+import com.btearbuds.autoconnect.data.Db;
+import com.btearbuds.autoconnect.data.Prefs;
+import com.btearbuds.autoconnect.logic.BatteryAlertEngine;
+import com.btearbuds.autoconnect.logic.RetryPolicy;
+import com.btearbuds.autoconnect.logic.VendorBatteryParser;
+import com.btearbuds.autoconnect.service.Notifs;
+
+import java.io.Serializable;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.CopyOnWriteArrayList;
+
+/**
+ * The single place that talks to Android Bluetooth.
+ *
+ * Everything runs on the main thread. The controller is "active" only while something holds it
+ * (the monitoring service, a visible screen, or the Quick Settings tile) - when nobody holds it,
+ * all receivers are unregistered and nothing runs.
+ *
+ * Honest limits (Android 11, no root, public APIs only):
+ *  - There is no public API for an app to start an A2DP/headset connection. "Connect" therefore
+ *    sends a Bluetooth LE connection request to dual-mode/LE devices and then VERIFIES the real
+ *    profile state. For classic-only devices nothing can be requested and the user is told so.
+ *  - There is no public API to disconnect a headset, so none is offered.
+ *  - Success is only ever reported when Android's profile state says the headset is connected.
+ */
+public final class BtController {
+
+    public interface Listener {
+        void onSnapshot(Snapshot snapshot);
+    }
+
+    private static BtController instance;
+
+    public static synchronized BtController get(Context context) {
+        if (instance == null) {
+            instance = new BtController(context.getApplicationContext());
+        }
+        return instance;
+    }
+
+    // Broadcast used by Android's Bluetooth stack for device battery changes. The constants are
+    // not in the public SDK, so the strings are used directly. Only 0..100 is ever accepted.
+    private static final String ACTION_BATTERY_LEVEL_CHANGED =
+            "android.bluetooth.device.action.BATTERY_LEVEL_CHANGED";
+    private static final String EXTRA_BATTERY_LEVEL =
+            "android.bluetooth.device.extra.BATTERY_LEVEL";
+    private static final int APPLE_COMPANY_ID = 76;
+
+    private static final long STARTUP_SETTLE_MS = 2500L;
+    private static final long ADAPTER_ON_DELAY_MS = 5000L;
+    private static final long PROFILE_GRACE_MS = 7000L;
+    private static final long ATTEMPT_TIMEOUT_MS = 15000L;
+    private static final long VERIFY_AFTER_LINK_MS = 8000L;
+    private static final long BATTERY_PROBE_DELAY_MS = 20000L;
+    private static final long BATTERY_PROBE_TIMEOUT_MS = 15000L;
+    private static final long PROXY_WAIT_MS = 1200L;
+    private static final long HISTORY_MIN_INTERVAL_MS = 10L * 60L * 1000L;
+
+    private final Context app;
+    private final Handler h = new Handler(Looper.getMainLooper());
+    private final Prefs prefs;
+    private final Db db;
+    private final List<Listener> listeners = new CopyOnWriteArrayList<Listener>();
+    private final BatteryAlertEngine alertEngine;
+
+    private int acquireCount;
+    private int activeCount;
+    private boolean receiversRegistered;
+    private boolean startupSettled;
+
+    private BluetoothAdapter adapter;
+    private boolean permissionOk = true;
+    private boolean adapterOn;
+
+    private BluetoothA2dp a2dp;
+    private boolean a2dpUsable;
+    private boolean a2dpRequested;
+    private BluetoothHeadset hfp;
+    private boolean hfpUsable;
+    private boolean hfpRequested;
+
+    private String prefAddress;
+    private String prefName;
+
+    private int a2dpState = BluetoothProfile.STATE_DISCONNECTED;
+    private int hfpState = BluetoothProfile.STATE_DISCONNECTED;
+    private int aclState = Snapshot.ACL_UNKNOWN;
+    private long aclTime;
+    private boolean linkedNoAudio;
+    private Boolean a2dpPlaying;
+    private boolean wasConnected;
+    private long connectedSince;
+    private boolean otherAudioConnected;
+    private String otherAudioName;
+
+    private boolean inFlight;
+    private boolean classicNoted;
+    private boolean attemptManual;
+    private long attemptStart;
+    private int failedAttempts;
+    private boolean gaveUp;
+    private boolean pending;
+    private String pendingReason;
+    private long nextAttemptAt;
+    private String lastAttemptResult;
+    private Boolean lastAttemptOk;
+    private GattProbe attemptProbe;
+    private GattProbe batteryProbe;
+    private int batProbeState;
+
+    private Integer batSingle;
+    private Integer batLeft;
+    private Integer batRight;
+    private long batTime;
+    private String batSource;
+    private boolean batLive;
+    private final Map<String, long[]> lastStored = new HashMap<String, long[]>();
+
+    private BtController(Context appContext) {
+        this.app = appContext;
+        this.prefs = new Prefs(appContext);
+        this.db = Db.get(appContext);
+        this.alertEngine = new BatteryAlertEngine(prefs.alertedKeys());
+    }
+
+    // ------------------------------------------------------------------ lifecycle
+
+    /**
+     * @param active true for holders that are allowed to trigger automatic connection attempts
+     *               (the monitoring service and the visible main screen). Passive holders (the
+     *               device list, history, Quick Settings tile peeking) only observe.
+     */
+    public void acquire(boolean active) {
+        acquireCount++;
+        if (active) {
+            activeCount++;
+        }
+        if (acquireCount == 1) {
+            startUp();
+        } else if (active && activeCount == 1) {
+            onActiveStarted();
+        }
+    }
+
+    public void release(boolean active) {
+        if (acquireCount == 0) {
+            return;
+        }
+        acquireCount--;
+        if (active && activeCount > 0) {
+            activeCount--;
+        }
+        if (acquireCount == 0) {
+            activeCount = 0;
+            shutDown();
+        } else if (active && activeCount == 0) {
+            cancelPendingAttempt();
+            gaveUp = false;
+            publish();
+        }
+    }
+
+    private void onActiveStarted() {
+        if (startupSettled && !isConnectedNow() && canAutoConnect() && !pending && !inFlight) {
+            failedAttempts = 0;
+            gaveUp = false;
+            schedulePending("Monitoring started", 3000L);
+        }
+    }
+
+    public void addListener(Listener l) {
+        if (!listeners.contains(l)) {
+            listeners.add(l);
+        }
+    }
+
+    public void removeListener(Listener l) {
+        listeners.remove(l);
+    }
+
+    private void startUp() {
+        adapter = BtUtil.adapter(app);
+        permissionOk = BtUtil.hasPermission(app);
+        adapterOn = readAdapterOn();
+        prefAddress = prefs.preferredAddress();
+        prefName = prefs.preferredName();
+        wasConnected = false;
+        connectedSince = 0L;
+        aclState = Snapshot.ACL_UNKNOWN;
+        linkedNoAudio = false;
+        a2dpState = BluetoothProfile.STATE_DISCONNECTED;
+        hfpState = BluetoothProfile.STATE_DISCONNECTED;
+        a2dpPlaying = null;
+        inFlight = false;
+        pending = false;
+        nextAttemptAt = 0L;
+        failedAttempts = 0;
+        gaveUp = false;
+        classicNoted = false;
+        batLive = false;
+        batProbeState = 0;
+        startupSettled = false;
+        registerReceivers();
+        ensureProxies();
+        h.removeCallbacks(initialCheckRunnable);
+        h.postDelayed(initialCheckRunnable, STARTUP_SETTLE_MS);
+        publish();
+    }
+
+    private void shutDown() {
+        unregisterReceivers();
+        cancelAllTimers();
+        if (attemptProbe != null) {
+            attemptProbe.cancel();
+            attemptProbe = null;
+        }
+        if (batteryProbe != null) {
+            batteryProbe.cancel();
+            batteryProbe = null;
+        }
+        inFlight = false;
+        closeProxies();
+    }
+
+    private boolean readAdapterOn() {
+        try {
+            return adapter != null && permissionOk && adapter.isEnabled();
+        } catch (SecurityException e) {
+            permissionOk = false;
+            return false;
+        }
+    }
+
+    // ------------------------------------------------------------------ profile proxies
+
+    private final BluetoothProfile.ServiceListener serviceListener =
+            new BluetoothProfile.ServiceListener() {
+                @Override
+                public void onServiceConnected(final int profile, final BluetoothProfile proxy) {
+                    h.post(new Runnable() {
+                        @Override
+                        public void run() {
+                            handleServiceConnected(profile, proxy);
+                        }
+                    });
+                }
+
+                @Override
+                public void onServiceDisconnected(final int profile) {
+                    h.post(new Runnable() {
+                        @Override
+                        public void run() {
+                            handleServiceDisconnected(profile);
+                        }
+                    });
+                }
+            };
+
+    private void ensureProxies() {
+        if (adapter == null || !adapterOn || !permissionOk) {
+            return;
+        }
+        try {
+            if (!a2dpRequested) {
+                a2dpRequested = true;
+                if (!adapter.getProfileProxy(app, serviceListener, BluetoothProfile.A2DP)) {
+                    a2dpRequested = false;
+                }
+            }
+            if (!hfpRequested) {
+                hfpRequested = true;
+                if (!adapter.getProfileProxy(app, serviceListener, BluetoothProfile.HEADSET)) {
+                    hfpRequested = false;
+                }
+            }
+        } catch (SecurityException e) {
+            permissionOk = false;
+        }
+    }
+
+    private void closeProxies() {
+        if (adapter != null) {
+            try {
+                if (a2dp != null) {
+                    adapter.closeProfileProxy(BluetoothProfile.A2DP, a2dp);
+                }
+                if (hfp != null) {
+                    adapter.closeProfileProxy(BluetoothProfile.HEADSET, hfp);
+                }
+            } catch (RuntimeException e) {
+                // ignore
+            }
+        }
+        a2dp = null;
+        hfp = null;
+        a2dpUsable = false;
+        hfpUsable = false;
+        a2dpRequested = false;
+        hfpRequested = false;
+    }
+
+    private void handleServiceConnected(int profile, BluetoothProfile proxy) {
+        if (acquireCount == 0) {
+            try {
+                if (adapter != null) {
+                    adapter.closeProfileProxy(profile, proxy);
+                }
+            } catch (RuntimeException e) 
